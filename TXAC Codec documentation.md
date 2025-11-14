@@ -6,11 +6,11 @@ Lossy audio compression codec with AVX optimization.
 
 ## 📦 Programs
 
-### 1\. **txac\_encode** - Encoder (avx\_input\_v2.c)
+### 1\. **txac\_input.c** - Encoder (txacinput.exe)
 
 Converts any audio format to `.txac`.
 
-**New Features:**
+**Features:**
 
   * ✅ Accepts any file name via arguments.
   * ✅ Supports 16-bit WAV (automatically converts to 32-bit).
@@ -24,44 +24,44 @@ Converts any audio format to `.txac`.
 
 ```bash
 # Windows with Zig
-zig cc avx_input_v2.c -std=gnu99 -pthread -O3 -mavx2 -lm -o txac_encode.exe
+zig cc txac_input.c -std=gnu99 -pthread -O3 -mavx2 -lm -o txacinput.exe
 
 # Linux
-gcc avx_input_v2.c -std=gnu99 -pthread -O3 -mavx2 -lm -o txac_encode
+gcc txac_input.c -std=gnu99 -pthread -O3 -mavx2 -lm -o txacinput
 ```
 
 **Usage:**
 
 ```bash
 # WAV (processed directly, no conversion)
-txac_encode input.wav output.txac
+txacinput input.wav output.txac
 
 # FLAC (converted via ffmpeg)
-txac_encode input.flac output.txac
+txacinput input.flac output.txac
 
 # MP3 (converted via ffmpeg)
-txac_encode input.mp3 output.txac
+txacinput input.mp3 output.txac
 
 # M4A/AAC (converted via ffmpeg)
-txac_encode input.m4a output.txac
+txacinput input.m4a output.txac
 
 # OGG Vorbis (converted via ffmpeg)
-txac_encode input.ogg output.txac
+txacinput input.ogg output.txac
 
 # OPUS (converted via ffmpeg)
-txac_encode input.opus output.txac
+txacinput input.opus output.txac
 
 # Any other format supported by ffmpeg
-txac_encode input.wma output.txac
+txacinput input.wma output.txac
 ```
 
 -----
 
-### 2\. **txac\_decode** - Decoder (avx\_output\_v2.c)
+### 2\. **txac\_output.c** - Decoder (txacoutput.exe)
 
 Converts `.txac` to WAV.
 
-**New Features:**
+**Features:**
 
   * ✅ Accepts any file name via arguments.
   * ✅ Specifies sample rate and channels via command line.
@@ -72,25 +72,25 @@ Converts `.txac` to WAV.
 
 ```bash
 # Windows with Zig
-zig cc avx_output_v2.c -std=gnu99 -pthread -O3 -mavx2 -lm -o txac_decode.exe
+zig cc txac_output.c -std=gnu99 -pthread -O3 -mavx2 -lm -o txacoutput.exe
 
 # Linux
-gcc avx_output_v2.c -std=gnu99 -pthread -O3 -mavx2 -lm -o txac_decode
+gcc txac_output.c -std=gnu99 -pthread -O3 -mavx2 -lm -o txacoutput
 ```
 
 **Usage:**
 
 ```bash
 # Stereo 44100 Hz
-txac_decode audio.txac output.wav 44100 2
+txacoutput audio.txac output.wav 44100 2
 
 # Mono 48000 Hz
-txac_decode audio.txac output.wav 48000 1
+txacoutput audio.txac output.wav 48000 1
 ```
 
 -----
 
-### 3\. **txacplay** - Player
+### 3\. **txacplay.c** - Player (txacplay.exe)
 
 Plays `.txac` directly.
 
@@ -201,7 +201,7 @@ All critical operations use AVX (processes 8 samples at a time):
 
 ## 📝 .txac Format
 
-  * **Extension:** `.txac` (Text Audio Compressed).
+  * **Extension:** `.txac` (Text Audio Codec).
   * **Structure:** 4 bits per symbol (16 symbols: `0-9`, `^`, `~`, `(`, `)`, `-`, `,`).
   * **Compression:**
       * `^` = consecutive repetition (e.g., `100^50` = 50x the value 100).
@@ -217,20 +217,20 @@ All critical operations use AVX (processes 8 samples at a time):
 
 ```bash
 # 1. Encode (WAV → TXAC)
-txac_encode music.wav music.txac 110
+txacinput music.wav music.txac 110
 
 # 2. Play (TXAC direct)
 txacplay music.txac 44100 2
 
 # 3. Decode (TXAC → WAV)
-txac_decode music.txac restored.wav 44100 2
+txacoutput music.txac restored.wav 44100 2
 ```
 
 ### With FLAC:
 
 ```bash
 # Encode FLAC directly
-txac_encode album.flac album.txac 110
+txacinput album.flac album.txac 110
 
 # Play
 txacplay album.txac 44100 2
@@ -246,6 +246,7 @@ txacplay album.txac 44100 2
   * ✅ **AVX Optimization** - 8x faster processing.
   * ✅ **Integrated Player** - plays directly.
   * ✅ **Flexible command line** - any file, any configuration.
+  * ✅ **Very versatile for compression** - compression methods like zip will actually make txac smaller (but won't run).
 
 -----
 
@@ -273,5 +274,6 @@ txacplay album.txac 44100 2
   * Check if you are passing the correct number of channels.
 
 **Flickering in the player**
+
 
   * Increase the buffer: modify `.buffer_frames` in the code.
