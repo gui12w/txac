@@ -1,152 +1,171 @@
+/*
+TXAC Decoder - Converte .txac para WAV
+Tudo processado em RAM com otimização AVX
+
+Compilar:
+    zig cc avx_output_v2.c -std=gnu99 -pthread -O3 -mavx2 -lm -o txac_decode.exe
+    
+Uso:
+    txac_decode input.txac output.wav sample_rate channels
+    txac_decode audio.txac audio.wav 44100 2
+*/
+
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-#include <math.h> // Para usar pow()
-#include <immintrin.h> // Para intrínsecos AVX (ex: _mm256_*)
+#include <math.h>
+#include <immintrin.h>
 
-// Tamanhos iniciais e para realocação (podem ser ajustados)
-#define INITIAL_CHARS_CAPACITY 1024 * 1024  // 1 MB inicial para o texto
-#define INITIAL_SAMPLES_CAPACITY 512 * 1024 // 512 KB inicial para as amostras
-#define GROWTH_FACTOR 2                   // Fator de crescimento para realocação (dobra o tamanho)
-
-// Valor de ganho em decibéis
+#define INITIAL_CHARS_CAPACITY (1024 * 1024)
+#define INITIAL_SAMPLES_CAPACITY (512 * 1024)
+#define GROWTH_FACTOR 2
 #define GAIN_DB 110.0f
 #define AMPLITUDE_FACTOR pow(10.0f, GAIN_DB / 20.0f)
-
-// Limites para int32_t para evitar clipping
 #define INT32_MAX_VAL 2147483647
 #define INT32_MIN_VAL -2147483648
+#define AVX_BLOCK_SIZE 8
 
-// Declarando os ponteiros e suas capacidades e contadores
-char *texto_decodificado = NULL;
-size_t texto_capacity = 0; // Capacidade atual do buffer de texto
-size_t texto_length = 0;   // Comprimento atual do texto
-
-int32_t *samples = NULL;
-size_t samples_capacity = 0; // Capacidade atual do buffer de amostras
-int sample_count = 0;        // Contador de amostras de áudio
-
-
-
-// Novo mapa de 16 símbolos válidos
+// Mapa de símbolos
 const char simbolos[16] = {
     '0','1','2','3','4','5','6','7','8','9',
     ',', '^', '~', '(', ')', '-'
 };
 
-// Converte valor de 4 bits para caractere
+// Estruturas
+typedef struct {
+    char *data;
+    size_t capacity;
+    size_t length;
+} TextBuffer;
+
+typedef struct {
+    int32_t *samples;
+    size_t capacity;
+    int sample_count;
+} AudioBuffer;
+
 char bit4_para_char(int val) {
     if (val >= 0 && val < 16)
         return simbolos[val];
-    return '?'; // Caractere inválido ou erro
+    return '?';
 }
 
+// ============================================================================
+// BUFFER DE TEXTO
+// ============================================================================
 
-
-// Função para garantir que o buffer de texto tenha capacidade suficiente
-void ensure_text_capacity(size_t required_space) {
-    if (texto_length + required_space >= texto_capacity) {
-        size_t new_capacity = texto_capacity == 0 ? INITIAL_CHARS_CAPACITY : texto_capacity * GROWTH_FACTOR;
-        while (texto_length + required_space >= new_capacity) {
-            new_capacity *= GROWTH_FACTOR;
-        }
-
-        char *new_ptr = (char *)realloc(texto_decodificado, new_capacity);
-        if (new_ptr == NULL) {
-            perror("Erro ao realocar memória para texto_decodificado");
-            free(texto_decodificado); // Libera o que foi alocado antes de sair
-            exit(EXIT_FAILURE);
-        }
-        texto_decodificado = new_ptr;
-        texto_capacity = new_capacity;
-        printf("Debug: Capacidade de texto realocada para %zu bytes.\n", texto_capacity);
+void init_text_buffer(TextBuffer *buf) {
+    buf->capacity = INITIAL_CHARS_CAPACITY;
+    buf->length = 0;
+    buf->data = (char*)malloc(buf->capacity);
+    if (!buf->data) {
+        fprintf(stderr, "Erro ao alocar buffer de texto\n");
+        exit(1);
     }
 }
 
-// Função corrigida: Lê um arquivo binário (4 bits por símbolo) e escreve
-// os caracteres decodificados no buffer de texto dinamicamente alocado.
-void binario_para_texto(const char *entrada_bin) {
-    FILE *fin = fopen(entrada_bin, "rb");
-    if (!fin) {
-        perror("Erro ao abrir arquivo binário de entrada");
-        exit(EXIT_FAILURE);
+void ensure_text_capacity(TextBuffer *buf, size_t required) {
+    if (buf->length + required >= buf->capacity) {
+        size_t new_cap = buf->capacity * GROWTH_FACTOR;
+        while (buf->length + required >= new_cap) {
+            new_cap *= GROWTH_FACTOR;
+        }
+        char *new_ptr = (char*)realloc(buf->data, new_cap);
+        if (!new_ptr) {
+            fprintf(stderr, "Erro ao realocar texto\n");
+            exit(1);
+        }
+        buf->data = new_ptr;
+        buf->capacity = new_cap;
+    }
+}
+
+// ============================================================================
+// BUFFER DE ÁUDIO
+// ============================================================================
+
+void init_audio_buffer(AudioBuffer *buf) {
+    buf->capacity = INITIAL_SAMPLES_CAPACITY;
+    buf->sample_count = 0;
+    buf->samples = (int32_t*)malloc(buf->capacity * sizeof(int32_t));
+    if (!buf->samples) {
+        fprintf(stderr, "Erro ao alocar buffer de áudio\n");
+        exit(1);
+    }
+}
+
+void ensure_audio_capacity(AudioBuffer *buf, size_t required) {
+    if (buf->sample_count + required >= buf->capacity) {
+        size_t new_cap = buf->capacity * GROWTH_FACTOR;
+        while (buf->sample_count + required >= new_cap) {
+            new_cap *= GROWTH_FACTOR;
+        }
+        int32_t *new_ptr = (int32_t*)realloc(buf->samples, new_cap * sizeof(int32_t));
+        if (!new_ptr) {
+            fprintf(stderr, "Erro ao realocar áudio\n");
+            exit(1);
+        }
+        buf->samples = new_ptr;
+        buf->capacity = new_cap;
+    }
+}
+
+// ============================================================================
+// DECODIFICAÇÃO BINÁRIA
+// ============================================================================
+
+void binario_para_texto(const char *arquivo_bin, TextBuffer *buf) {
+    FILE *f = fopen(arquivo_bin, "rb");
+    if (!f) {
+        perror("Erro ao abrir arquivo TXAC");
+        exit(1);
     }
 
+    init_text_buffer(buf);
     int byte;
-    texto_length = 0; // Resetar o comprimento do texto antes de preencher
 
-    // Loop para ler cada byte do arquivo binário
-    while ((byte = fgetc(fin)) != EOF) {
-        ensure_text_capacity(2); // Precisamos de espaço para 2 caracteres + '\0' (depois)
-
-        int high = (byte >> 4) & 0x0F; // Extrai os 4 bits mais significativos
-        int low  = byte & 0x0F;        // Extrai os 4 bits menos significativos
-
-        // Converte e armazena os caracteres no buffer
-        texto_decodificado[texto_length++] = bit4_para_char(high);
-        texto_decodificado[texto_length++] = bit4_para_char(low);
+    while ((byte = fgetc(f)) != EOF) {
+        ensure_text_capacity(buf, 2);
+        int high = (byte >> 4) & 0x0F;
+        int low = byte & 0x0F;
+        buf->data[buf->length++] = bit4_para_char(high);
+        buf->data[buf->length++] = bit4_para_char(low);
     }
 
-    ensure_text_capacity(1); // Garante espaço para o terminador nulo
-    texto_decodificado[texto_length] = '\0'; // Adiciona o terminador de string ao final
-    fclose(fin); // Fecha o arquivo de entrada
-}
-
-
-
-// Função para garantir que o buffer de amostras tenha capacidade suficiente
-void ensure_samples_capacity(size_t required_space) {
-    if (sample_count + required_space >= samples_capacity) {
-        size_t new_capacity = samples_capacity == 0 ? INITIAL_SAMPLES_CAPACITY : samples_capacity * GROWTH_FACTOR;
-        while (sample_count + required_space >= new_capacity) {
-            new_capacity *= GROWTH_FACTOR;
-        }
-
-        int32_t *new_ptr = (int32_t *)realloc(samples, new_capacity * sizeof(int32_t));
-        if (new_ptr == NULL) {
-            perror("Erro ao realocar memória para samples");
-            free(samples); // Libera o que foi alocado antes de sair
-            exit(EXIT_FAILURE);
-        }
-        samples = new_ptr;
-        samples_capacity = new_capacity;
-        printf("Debug: Capacidade de samples realocada para %zu amostras.\n", samples_capacity);
-    }
-}
-
-// Descompacta a string de texto (global) para o array global 'samples'
-// Agora aplica o ganho de 30 dB e previne o clipping, com otimização AVX.
-void descompactar_string() {
-    char buffer[128]; // Buffer temporário para partes da string
-    int i = 0;
-    int len = texto_length;
-    sample_count = 0;
-
-    // --- VARIÁVEIS AVX ---
-    // Usamos float (32 bits) para 8 elementos (256 bits)
-    const int AVX_BLOCK_SIZE = 8;
+    ensure_text_capacity(buf, 1);
+    buf->data[buf->length] = '\0';
+    fclose(f);
     
-    // Calcula o fator AVX apenas uma vez (deve ser float)
+    printf("✅ Arquivo binário decodificado: %zu bytes\n", buf->length);
+}
+
+// ============================================================================
+// DESCOMPACTAÇÃO COM AVX
+// ============================================================================
+
+void descompactar_string(TextBuffer *text, AudioBuffer *audio) {
+    init_audio_buffer(audio);
+    
+    char buffer[128];
+    size_t i = 0;
+    size_t len = text->length;
+
+    // Vetores AVX para aplicar ganho
     float factor_float = (float)AMPLITUDE_FACTOR;
-    
-    // Vetores constantes para AVX
-    // 1. Fator de multiplicação (o ganho)
     __m256 factor_vec = _mm256_set1_ps(factor_float);
-    
-    // 2. Limites de clipping (convertidos para int32_t vector)
     __m256i max_vec = _mm256_set1_epi32(INT32_MAX_VAL);
     __m256i min_vec = _mm256_set1_epi32(INT32_MIN_VAL);
-    // ----------------------
+
+    printf("🔄 Descompactando e aplicando ganho de %.1f dB...\n", GAIN_DB);
 
     while (i < len) {
-        // ... (Lógica de parsing permanece a mesma)
+        // Parse próximo token
         int b = 0;
-        while (i < len && texto_decodificado[i] != ',') {
+        while (i < len && text->data[i] != ',') {
             if (b < sizeof(buffer) - 1) {
-                buffer[b++] = texto_decodificado[i++];
+                buffer[b++] = text->data[i++];
             } else {
-                fprintf(stderr, "Aviso: Buffer interno de descompactação cheio. Ignorando excesso.\n");
                 i++;
             }
         }
@@ -156,212 +175,184 @@ void descompactar_string() {
         double num_double;
         int rep;
 
-        // Tenta decodificar padrões de compactação
+        // Padrão: número^repetições (usa AVX)
         if (sscanf(buffer, "%lf^%d", &num_double, &rep) == 2) {
-            // Padrão: número^repetições (ex: 100^5)
+            ensure_audio_capacity(audio, rep);
             
-            // Garante capacidade antes de adicionar qualquer coisa
-            ensure_samples_capacity(rep);
-            
-            // Vetor de float replicado com o valor base (num_double)
-            __m256 sample_float_vec = _mm256_set1_ps((float)num_double);
-
-            // --- PROCESSAMENTO AVX ---
+            __m256 sample_vec = _mm256_set1_ps((float)num_double);
             int avx_reps = rep / AVX_BLOCK_SIZE;
-            
+
+            // Processamento AVX
             for (int r = 0; r < avx_reps; r++) {
-                // 1. Aplicar Ganho (Multiplicação float vetorizada)
-                __m256 boosted_float_vec = _mm256_mul_ps(sample_float_vec, factor_vec);
-                
-                // 2. Converter para Inteiro 32-bit (com truncamento)
-                __m256i boosted_int_vec = _mm256_cvttps_epi32(boosted_float_vec);
-
-                // 3. Aplicar Clipping (max(min_val) e depois min(max_val) vetorizado)
-                // Garante que não é menor que INT32_MIN
-                __m256i clipped_min = _mm256_max_epi32(min_vec, boosted_int_vec); 
-                // Garante que não é maior que INT32_MAX
-                __m256i clipped_result = _mm256_min_epi32(max_vec, clipped_min); 
-
-                // 4. Armazenar o resultado (8 amostras) no buffer
-                // Usamos storeu (unaligned store) para segurança, já que samples pode não ser 32-byte alinhado
-                _mm256_storeu_si256((__m256i*)&samples[sample_count], clipped_result);
-                sample_count += AVX_BLOCK_SIZE;
+                __m256 boosted = _mm256_mul_ps(sample_vec, factor_vec);
+                __m256i boosted_int = _mm256_cvttps_epi32(boosted);
+                __m256i clipped_min = _mm256_max_epi32(min_vec, boosted_int);
+                __m256i clipped = _mm256_min_epi32(max_vec, clipped_min);
+                _mm256_storeu_si256((__m256i*)&audio->samples[audio->sample_count], clipped);
+                audio->sample_count += AVX_BLOCK_SIZE;
             }
 
-            // --- PROCESSAMENTO SEQUENCIAL (CAUDA) ---
-            // Processa o restante das amostras (< 8)
-            int remaining_reps = rep % AVX_BLOCK_SIZE;
-            double boosted_sample_seq = num_double * AMPLITUDE_FACTOR; // Pré-calcula o valor sequencial
-            
-            for (int r = 0; r < remaining_reps; r++) {
-                // Aplica clipping sequencialmente
-                if (boosted_sample_seq > INT32_MAX_VAL) samples[sample_count++] = INT32_MAX_VAL;
-                else if (boosted_sample_seq < INT32_MIN_VAL) samples[sample_count++] = INT32_MIN_VAL;
-                else samples[sample_count++] = (int32_t)boosted_sample_seq;
+            // Cauda
+            int remaining = rep % AVX_BLOCK_SIZE;
+            double boosted_seq = num_double * AMPLITUDE_FACTOR;
+            for (int r = 0; r < remaining; r++) {
+                if (boosted_seq > INT32_MAX_VAL) 
+                    audio->samples[audio->sample_count++] = INT32_MAX_VAL;
+                else if (boosted_seq < INT32_MIN_VAL) 
+                    audio->samples[audio->sample_count++] = INT32_MIN_VAL;
+                else 
+                    audio->samples[audio->sample_count++] = (int32_t)boosted_seq;
             }
 
-        } else if (sscanf(buffer, "%lf~%d", &num_double, &rep) == 2) {
-            // Padrão: número~seguido por 'rep' outros números (sem vetorização AVX)
+        } 
+        // Padrão: número~seguido (sem AVX)
+        else if (sscanf(buffer, "%lf~%d", &num_double, &rep) == 2) {
+            ensure_audio_capacity(audio, rep + 2);
+            double boosted = num_double * AMPLITUDE_FACTOR;
             
-            // ... (CÓDIGO ORIGINAL PARA ~ PERMANECE INALTERADO)
-            ensure_samples_capacity(1);
-            double boosted_sample_initial = num_double * AMPLITUDE_FACTOR;
+            int32_t val;
+            if (boosted > INT32_MAX_VAL) val = INT32_MAX_VAL;
+            else if (boosted < INT32_MIN_VAL) val = INT32_MIN_VAL;
+            else val = (int32_t)boosted;
             
-            if (boosted_sample_initial > INT32_MAX_VAL) samples[sample_count++] = INT32_MAX_VAL;
-            else if (boosted_sample_initial < INT32_MIN_VAL) samples[sample_count++] = INT32_MIN_VAL;
-            else samples[sample_count++] = (int32_t)boosted_sample_initial;
+            audio->samples[audio->sample_count++] = val;
 
             for (int r = 0; r < rep; r++) {
                 b = 0;
-                while (i < len && texto_decodificado[i] != ',') {
+                while (i < len && text->data[i] != ',') {
                     if (b < sizeof(buffer) - 1) {
-                        buffer[b++] = texto_decodificado[i++];
+                        buffer[b++] = text->data[i++];
                     } else {
-                        fprintf(stderr, "Aviso: Buffer interno de descompactação (follow-up) cheio. Ignorando excesso.\n");
                         i++;
                     }
                 }
                 buffer[b] = '\0';
                 i++;
 
-                double temp_double;
-                if (sscanf(buffer, "%lf", &temp_double) == 1) {
-                    ensure_samples_capacity(1);
-                    double boosted_temp = temp_double * AMPLITUDE_FACTOR;
+                double temp;
+                if (sscanf(buffer, "%lf", &temp) == 1) {
+                    ensure_audio_capacity(audio, 1);
+                    double temp_boosted = temp * AMPLITUDE_FACTOR;
                     
-                    if (boosted_temp > INT32_MAX_VAL) samples[sample_count++] = INT32_MAX_VAL;
-                    else if (boosted_temp < INT32_MIN_VAL) samples[sample_count++] = INT32_MIN_VAL;
-                    else samples[sample_count++] = (int32_t)boosted_temp;
-                } else {
-                     fprintf(stderr, "Aviso: Erro de parsing no valor de série: '%s'. Ignorando.\n", buffer);
+                    int32_t temp_val;
+                    if (temp_boosted > INT32_MAX_VAL) temp_val = INT32_MAX_VAL;
+                    else if (temp_boosted < INT32_MIN_VAL) temp_val = INT32_MIN_VAL;
+                    else temp_val = (int32_t)temp_boosted;
+                    
+                    audio->samples[audio->sample_count++] = temp_val;
                 }
             }
-            ensure_samples_capacity(1);
-            samples[sample_count++] = (int32_t)boosted_sample_initial;
+            
+            audio->samples[audio->sample_count++] = val;
 
-        } else if (sscanf(buffer, "%lf", &num_double) == 1) {
-            // Padrão: apenas um número (sem vetorização AVX)
+        } 
+        // Padrão: apenas número
+        else if (sscanf(buffer, "%lf", &num_double) == 1) {
+            ensure_audio_capacity(audio, 1);
+            double boosted = num_double * AMPLITUDE_FACTOR;
             
-            // ... (CÓDIGO ORIGINAL PARA VALOR ÚNICO PERMANECE INALTERADO)
-            ensure_samples_capacity(1);
-            double boosted_sample = num_double * AMPLITUDE_FACTOR;
+            int32_t val;
+            if (boosted > INT32_MAX_VAL) val = INT32_MAX_VAL;
+            else if (boosted < INT32_MIN_VAL) val = INT32_MIN_VAL;
+            else val = (int32_t)boosted;
             
-            if (boosted_sample > INT32_MAX_VAL) samples[sample_count++] = INT32_MAX_VAL;
-            else if (boosted_sample < INT32_MIN_VAL) samples[sample_count++] = INT32_MIN_VAL;
-            else samples[sample_count++] = (int32_t)boosted_sample;
-        } else {
-            fprintf(stderr, "Erro de parsing: '%s' não corresponde a nenhum padrão de descompactação. Ignorando.\n", buffer);
+            audio->samples[audio->sample_count++] = val;
         }
     }
+
+    printf("✅ Descompactado: %d amostras\n", audio->sample_count);
 }
 
+// ============================================================================
+// SALVAR WAV
+// ============================================================================
 
-
-// Salva o array global 'samples' em um arquivo WAV
-void salvar_wav(const char *saida_wav) {
-    FILE *fwav = fopen(saida_wav, "wb");
-    if (!fwav) {
-        perror("Erro ao criar arquivo WAV");
+void salvar_wav(const char *arquivo, AudioBuffer *audio, uint32_t sample_rate, uint16_t channels) {
+    FILE *f = fopen(arquivo, "wb");
+    if (!f) {
+        perror("Erro ao criar WAV");
         return;
     }
-    int dih;
-    int bruh;
-    // Prompt for sample rate (default: 44100)
-    printf("Coloque quantos hz o audio tem: ");
-    scanf("%d", &dih);
-    printf("Coloque quantos canais o audio tem: ");
-    scanf("%d", &bruh);
-    // Parâmetros do formato WAV
-    uint32_t sampleRate = dih;
-    uint16_t numChannels = bruh;   // Mono
-    uint16_t bitsPerSample = 32;   // int32_t
-    uint32_t byteRate = sampleRate * numChannels * (bitsPerSample / 8); // Bytes por segundo
-    uint16_t blockAlign = numChannels * (bitsPerSample / 8);           // Bytes por bloco (amostra)
 
-    // Cabeçalho WAV básico (RIFF, WAVE, fmt, data chunks)
-    uint8_t cabecalho[44];
-    memset(cabecalho, 0, sizeof(cabecalho));
+    printf("💾 Salvando WAV: %d Hz, %d canais...\n", sample_rate, channels);
 
-    // Chunk ID "RIFF"
-    memcpy(cabecalho, "RIFF", 4);
-    // Tamanho total do arquivo (será preenchido depois)
-    // cabecalho[4-7]
-    // Format "WAVE"
-    memcpy(cabecalho + 8, "WAVE", 4);
+    uint16_t bits_per_sample = 32;
+    uint32_t byte_rate = sample_rate * channels * (bits_per_sample / 8);
+    uint16_t block_align = channels * (bits_per_sample / 8);
 
-    // Subchunk1 ID "fmt "
-    memcpy(cabecalho + 12, "fmt ", 4);
-    // Subchunk1 Size (16 para PCM)
-    uint32_t subchunk1Size = 16;
-    memcpy(cabecalho + 16, &subchunk1Size, 4);
-    // Audio Format (1 para PCM)
-    uint16_t audioFormat = 1;
-    memcpy(cabecalho + 20, &audioFormat, 2);
-    // Number of Channels
-    memcpy(cabecalho + 22, &numChannels, 2);
-    // Sample Rate
-    memcpy(cabecalho + 24, &sampleRate, 4);
-    // Byte Rate
-    memcpy(cabecalho + 28, &byteRate, 4);
-    // Block Align
-    memcpy(cabecalho + 32, &blockAlign, 2);
-    // Bits Per Sample
-    memcpy(cabecalho + 34, &bitsPerSample, 2);
+    // Cabeçalho WAV
+    uint8_t header[44];
+    memset(header, 0, sizeof(header));
 
-    // Subchunk2 ID "data"
-    memcpy(cabecalho + 36, "data", 4);
-    // Subchunk2 Size (tamanho dos dados, será preenchido depois)
-    // cabecalho[40-43]
+    memcpy(header, "RIFF", 4);
+    memcpy(header + 8, "WAVE", 4);
+    memcpy(header + 12, "fmt ", 4);
+    
+    uint32_t subchunk1_size = 16;
+    memcpy(header + 16, &subchunk1_size, 4);
+    
+    uint16_t audio_format = 1;
+    memcpy(header + 20, &audio_format, 2);
+    memcpy(header + 22, &channels, 2);
+    memcpy(header + 24, &sample_rate, 4);
+    memcpy(header + 28, &byte_rate, 4);
+    memcpy(header + 32, &block_align, 2);
+    memcpy(header + 34, &bits_per_sample, 2);
+    memcpy(header + 36, "data", 4);
 
-    // Escreve o cabeçalho no arquivo
-    fwrite(cabecalho, 1, 44, fwav);
+    fwrite(header, 1, 44, f);
 
-    // Escreve os dados das amostras
-    for (int i = 0; i < sample_count; i++) {
-        fwrite(&samples[i], sizeof(int32_t), 1, fwav);
+    // Escreve amostras
+    for (int i = 0; i < audio->sample_count; i++) {
+        fwrite(&audio->samples[i], sizeof(int32_t), 1, f);
     }
 
-    // Calcula os tamanhos finais
-    int32_t tamanho_dados = sample_count * sizeof(int32_t);
-    int32_t tamanho_total = 36 + tamanho_dados; // 36 bytes antes do chunk de dados
+    // Atualiza tamanhos
+    int32_t data_size = audio->sample_count * sizeof(int32_t);
+    int32_t file_size = 36 + data_size;
 
-    // Volta e preenche os tamanhos corretos no cabeçalho
-    fseek(fwav, 4, SEEK_SET);     // Posição para FileSize
-    fwrite(&tamanho_total, 4, 1, fwav);
+    fseek(f, 4, SEEK_SET);
+    fwrite(&file_size, 4, 1, f);
 
-    fseek(fwav, 40, SEEK_SET);    // Posição para DataSize
-    fwrite(&tamanho_dados, 4, 1, fwav);
+    fseek(f, 40, SEEK_SET);
+    fwrite(&data_size, 4, 1, f);
 
-    fclose(fwav);
-    printf("✅ Arquivo WAV salvo com %d amostras em '%s'\n", sample_count, saida_wav);
+    fclose(f);
+    printf("✅ WAV salvo: %s (%d amostras)\n", arquivo, audio->sample_count);
 }
 
+// ============================================================================
+// MAIN
+// ============================================================================
 
+int main(int argc, char **argv) {
+    if (argc < 5) {
+        printf("Uso: %s <input.txac> <output.wav> <sample_rate> <channels>\n", argv[0]);
+        printf("Exemplo: %s audio.txac audio.wav 44100 2\n", argv[0]);
+        return 1;
+    }
 
-int main() {
-    const char *entrada_bin_file = "compactado_4bits.txac";
-    const char *saida_wav_file = "restaurado_4bits.wav";
+    const char *input = argv[1];
+    const char *output = argv[2];
+    uint32_t sample_rate = atoi(argv[3]);
+    uint16_t channels = atoi(argv[4]);
 
+    printf("\n=== TXAC DECODER ===\n");
+    printf("Input: %s\n", input);
+    printf("Output: %s\n", output);
+    printf("Sample rate: %d Hz\n", sample_rate);
+    printf("Canais: %d\n\n", channels);
 
+    TextBuffer text = {0};
+    AudioBuffer audio = {0};
 
-    // Aloca a memória inicial para os buffers
-    ensure_text_capacity(0); // Aloca a capacidade inicial para texto_decodificado
-    ensure_samples_capacity(0); // Aloca a capacidade inicial para samples
+    binario_para_texto(input, &text);
+    descompactar_string(&text, &audio);
+    salvar_wav(output, &audio, sample_rate, channels);
 
-    printf("Iniciando a decodificação do arquivo binário...\n");
-    binario_para_texto(entrada_bin_file);
-    printf("Decodificação binária concluída. Tamanho do texto: %zu\n", texto_length);
+    free(text.data);
+    free(audio.samples);
 
-    printf("Iniciando a descompactação da string e aplicação de ganho de %.1f dB...\n", GAIN_DB);
-    descompactar_string();
-    printf("Descompactação e ganho concluídos. Total de amostras: %d\n", sample_count);
-
-    printf("Salvando arquivo WAV...\n");
-    salvar_wav(saida_wav_file);
-
-    // Lembre-se de liberar a memória alocada dinamicamente
-    free(texto_decodificado);
-    free(samples);
-
+    printf("\n✅ Decodificação concluída!\n");
     return 0;
 }
