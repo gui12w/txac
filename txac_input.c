@@ -179,6 +179,34 @@ int ler_wav(const char *arquivo_wav, AudioBuffer *buf, double reduzir_db) {
     printf("📊 WAV Info: %d Hz, %d canais, %d bits\n", 
            buf->sample_rate, buf->channels, buf->bits_per_sample);
 
+    // CRÍTICO: Procura pelo chunk 'data' e posiciona o ponteiro corretamente
+    // Alguns WAVs têm chunks extras (LIST, INFO, etc.) antes do 'data'
+    fseek(f, 36, SEEK_SET); // Volta para depois do fmt chunk
+    
+    uint8_t chunk_id[4];
+    uint32_t chunk_size;
+    int found_data = 0;
+    
+    while (fread(chunk_id, 1, 4, f) == 4) {
+        fread(&chunk_size, 4, 1, f);
+        
+        if (memcmp(chunk_id, "data", 4) == 0) {
+            // Encontrou! Agora f está no início dos dados de áudio
+            found_data = 1;
+            printf("✅ Chunk 'data' encontrado, %u bytes de áudio\n", chunk_size);
+            break;
+        }
+        
+        // Não é 'data', pula este chunk
+        fseek(f, chunk_size, SEEK_CUR);
+    }
+    
+    if (!found_data) {
+        fprintf(stderr, "❌ Erro: Chunk 'data' não encontrado no WAV\n");
+        fclose(f);
+        return 0;
+    }
+
     // Calcula fator de redução AVX
     float fator_f = (float)pow(10.0, -reduzir_db / 20.0);
     __m256 factor_vec = _mm256_set1_ps(fator_f);
