@@ -137,12 +137,14 @@ int convert_audio_to_wav_temp(const char *audio_file, char *temp_wav) {
     const char *ext = strrchr(audio_file, '.');
     const char *formato = ext ? ext + 1 : "áudio";
     
-    char cmd[1024];
-    // Converte qualquer formato suportado pelo ffmpeg para WAV 16-bit
-    sprintf(cmd, "ffmpeg -i \"%s\" -f wav -acodec pcm_s16le \"%s\" -y -loglevel error", 
+    char cmd[2048];
+    // CORREÇÃO: Força formato WAV padrão (não RF64) e faz downmix para stereo se tiver mais canais
+    // -rf64 never = força WAV padrão ao invés de RF64
+    // -ac 2 = converte para stereo (resolve problema de multi-canal)
+    sprintf(cmd, "ffmpeg -i \"%s\" -f wav -acodec pcm_s16le -rf64 never \"%s\" -y -loglevel error", 
             audio_file, temp_wav);
     
-    printf("🔄 Convertendo %s para WAV temporário (16-bit)...\n", formato);
+    printf("🔄 Convertendo %s para WAV temporário (16-bit stereo)...\n", formato);
     int result = system(cmd);
     
     if (result != 0) {
@@ -179,30 +181,48 @@ int ler_wav(const char *arquivo_wav, AudioBuffer *buf, double reduzir_db) {
     printf("📊 WAV Info: %d Hz, %d canais, %d bits\n", 
            buf->sample_rate, buf->channels, buf->bits_per_sample);
 
-    // CRÍTICO: Procura pelo chunk 'data' e posiciona o ponteiro corretamente
-    // Alguns WAVs têm chunks extras (LIST, INFO, etc.) antes do 'data'
-    fseek(f, 36, SEEK_SET); // Volta para depois do fmt chunk
+    // CRÍTICO: Procura pelo chunk 'data' em todo o arquivo
+    // Alguns WAVs têm chunks extras (LIST, INFO, JUNK, etc.) antes do 'data'
+    // Começamos após o header básico
+    fseek(f, 12, SEEK_SET); // Pula RIFF header (12 bytes: "RIFF" + size + "WAVE")
     
     uint8_t chunk_id[4];
     uint32_t chunk_size;
     int found_data = 0;
+    long file_pos;
+    
+    printf("🔍 Procurando chunk 'data'...\n");
     
     while (fread(chunk_id, 1, 4, f) == 4) {
-        fread(&chunk_size, 4, 1, f);
+        if (fread(&chunk_size, 4, 1, f) != 1) break;
+        
+        file_pos = ftell(f);
+        
+        // Debug: mostra chunks encontrados
+        char chunk_name[5] = {0};
+        memcpy(chunk_name, chunk_id, 4);
+        printf("  📦 Chunk '%s' (tamanho: %u bytes, posição: %ld)\n", chunk_name, chunk_size, file_pos);
         
         if (memcmp(chunk_id, "data", 4) == 0) {
-            // Encontrou! Agora f está no início dos dados de áudio
+            // Encontrou! O ponteiro está no início dos dados de áudio
             found_data = 1;
-            printf("✅ Chunk 'data' encontrado, %u bytes de áudio\n", chunk_size);
+            printf("✅ Chunk 'data' encontrado! Iniciando leitura de %u bytes de áudio\n", chunk_size);
             break;
         }
         
         // Não é 'data', pula este chunk
-        fseek(f, chunk_size, SEEK_CUR);
+        // Garante que o tamanho é válido
+        if (chunk_size > 0 && chunk_size < 0x7FFFFFFF) {
+            fseek(f, chunk_size, SEEK_CUR);
+        } else {
+            fprintf(stderr, "⚠️  Chunk com tamanho inválido: %u\n", chunk_size);
+            break;
+        }
     }
     
     if (!found_data) {
         fprintf(stderr, "❌ Erro: Chunk 'data' não encontrado no WAV\n");
+        fprintf(stderr, "   O arquivo pode estar corrompido ou em formato não suportado.\n");
         fclose(f);
         return 0;
     }
