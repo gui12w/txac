@@ -1,15 +1,8 @@
 /*
-TXAC Player - Player de áudio para arquivos .txac
-Baseado no qoaplay.c
-
-Requer:
-    - "sokol_audio.h" (https://github.com/floooh/sokol/blob/master/sokol_audio.h)
-
-Compilar com Zig:
-    zig cc txacplay.c -std=gnu99 -lasound -pthread -O3 -o txacplay
-
-Ou com GCC:
-    gcc txacplay.c -std=gnu99 -lasound -pthread -O3 -o txacplay -lm
+TXAC Player v12.0 - Direct 4bit→Float Streaming
+- Elimina etapa intermediária de texto completo
+- Parsing direto: 4-bit → float buffer
+- Menor uso de RAM e processamento mais rápido
 */
 
 #include <stdio.h>
@@ -17,365 +10,17 @@ Ou com GCC:
 #include <stdint.h>
 #include <string.h>
 #include <math.h>
+#include <pthread.h>
+#include <immintrin.h>
 
-#define SOKOL_AUDIO_IMPL
-#include "sokol_audio.h"
+#if defined(_WIN32)
+    #include <windows.h>
+    #define THREAD_SLEEP_MS(ms) Sleep(ms)
+#else
+    #include <unistd.h>
+    #define THREAD_SLEEP_MS(ms) usleep((ms) * 1000)
+#endif
 
-/* ============================================================================
-   DECODER TXAC - Adaptado do seu codec
-   ============================================================================ */
-
-#define INITIAL_CHARS_CAPACITY (1024 * 1024)  // 1 MB inicial
-#define INITIAL_SAMPLES_CAPACITY (512 * 1024) // 512 KB inicial
-#define GROWTH_FACTOR 2
-#define GAIN_DB 110.0f
-#define AMPLITUDE_FACTOR pow(10.0f, GAIN_DB / 20.0f)
-#define INT32_MAX_VAL 2147483647
-#define INT32_MIN_VAL -2147483648
-#define FRAME_SIZE 2048  // Número de amostras por frame
-#define AVX_BLOCK_SIZE 8 // Processa 8 floats por vez com AVX
-
-// Mapa de 16 símbolos válidos
-const char simbolos[16] = {
-    '0','1','2','3','4','5','6','7','8','9',
-    ',', '^', '~', '(', ')', '-'
-};
-
-// Converte valor de 4 bits para caractere
-char bit4_para_char(int val) {
-    if (val >= 0 && val < 16)
-        return simbolos[val];
-    return '?';
-}
-
-/* ============================================================================
-   TXACPLAY - Estrutura e funções do player
-   ============================================================================ */
-
-typedef struct {
-    FILE *file;
-    
-    // Informações do áudio
-    uint32_t sample_rate;
-    uint16_t channels;
-    uint32_t total_samples;
-    
-    // Buffer de texto decodificado
-    char *texto_decodificado;
-    size_t texto_capacity;
-    size_t texto_length;
-    
-    // Buffer de amostras
-    int32_t *samples;
-    size_t samples_capacity;
-    int sample_count;
-    
-    // Posição atual
-    unsigned int sample_pos;
-    unsigned int buffer_pos;
-    
-    // Estado de pausa
-    int is_paused;
-    
-} txacplay_desc;
-
-// Função para garantir capacidade do buffer de texto
-void ensure_text_capacity(txacplay_desc *tp, size_t required_space) {
-    if (tp->texto_length + required_space >= tp->texto_capacity) {
-        size_t new_capacity = tp->texto_capacity == 0 ? 
-            INITIAL_CHARS_CAPACITY : tp->texto_capacity * GROWTH_FACTOR;
-        
-        while (tp->texto_length + required_space >= new_capacity) {
-            new_capacity *= GROWTH_FACTOR;
-        }
-
-        char *new_ptr = (char *)realloc(tp->texto_decodificado, new_capacity);
-        if (new_ptr == NULL) {
-            perror("Erro ao realocar memória para texto");
-            exit(EXIT_FAILURE);
-        }
-        tp->texto_decodificado = new_ptr;
-        tp->texto_capacity = new_capacity;
-    }
-}
-
-// Função para garantir capacidade do buffer de amostras
-void ensure_samples_capacity(txacplay_desc *tp, size_t required_space) {
-    if (tp->sample_count + required_space >= tp->samples_capacity) {
-        size_t new_capacity = tp->samples_capacity == 0 ? 
-            INITIAL_SAMPLES_CAPACITY : tp->samples_capacity * GROWTH_FACTOR;
-        
-        while (tp->sample_count + required_space >= new_capacity) {
-            new_capacity *= GROWTH_FACTOR;
-        }
-
-        int32_t *new_ptr = (int32_t *)realloc(tp->samples, new_capacity * sizeof(int32_t));
-        if (new_ptr == NULL) {
-            perror("Erro ao realocar memória para samples");
-            exit(EXIT_FAILURE);
-        }
-        tp->samples = new_ptr;
-        tp->samples_capacity = new_capacity;
-    }
-}
-
-// Decodifica arquivo binário 4-bit para texto
-void binario_para_texto(txacplay_desc *tp) {
-    rewind(tp->file);
-    tp->texto_length = 0;
-
-    int byte;
-    while ((byte = fgetc(tp->file)) != EOF) {
-        ensure_text_capacity(tp, 2);
-
-        int high = (byte >> 4) & 0x0F;
-        int low  = byte & 0x0F;
-
-        tp->texto_decodificado[tp->texto_length++] = bit4_para_char(high);
-        tp->texto_decodificado[tp->texto_length++] = bit4_para_char(low);
-    }
-
-    ensure_text_capacity(tp, 1);
-    tp->texto_decodificado[tp->texto_length] = '\0';
-}
-
-// Descompacta string e aplica ganho
-void descompactar_chunk(txacplay_desc *tp, int max_samples) {
-    char buffer[128];
-    int len = tp->texto_length;
-    tp->sample_count = 0;
-    tp->buffer_pos = 0;
-
-    while (tp->buffer_pos < len && tp->sample_count < max_samples) {
-        int b = 0;
-        while (tp->buffer_pos < len && tp->texto_decodificado[tp->buffer_pos] != ',') {
-            if (b < sizeof(buffer) - 1) {
-                buffer[b++] = tp->texto_decodificado[tp->buffer_pos++];
-            } else {
-                tp->buffer_pos++;
-            }
-        }
-        buffer[b] = '\0';
-        tp->buffer_pos++;
-
-        double num_double;
-        int rep;
-
-        if (sscanf(buffer, "%lf^%d", &num_double, &rep) == 2) {
-            // Padrão: número^repetições
-            ensure_samples_capacity(tp, rep);
-            double boosted_sample = num_double * AMPLITUDE_FACTOR;
-            
-            int32_t sample_val;
-            if (boosted_sample > INT32_MAX_VAL) sample_val = INT32_MAX_VAL;
-            else if (boosted_sample < INT32_MIN_VAL) sample_val = INT32_MIN_VAL;
-            else sample_val = (int32_t)boosted_sample;
-            
-            for (int r = 0; r < rep && tp->sample_count < max_samples; r++) {
-                tp->samples[tp->sample_count++] = sample_val;
-            }
-
-        } else if (sscanf(buffer, "%lf~%d", &num_double, &rep) == 2) {
-            // Padrão: número~seguido
-            ensure_samples_capacity(tp, rep + 2);
-            double boosted_sample = num_double * AMPLITUDE_FACTOR;
-            
-            int32_t sample_val;
-            if (boosted_sample > INT32_MAX_VAL) sample_val = INT32_MAX_VAL;
-            else if (boosted_sample < INT32_MIN_VAL) sample_val = INT32_MIN_VAL;
-            else sample_val = (int32_t)boosted_sample;
-            
-            tp->samples[tp->sample_count++] = sample_val;
-
-            for (int r = 0; r < rep && tp->sample_count < max_samples; r++) {
-                b = 0;
-                while (tp->buffer_pos < len && tp->texto_decodificado[tp->buffer_pos] != ',') {
-                    if (b < sizeof(buffer) - 1) {
-                        buffer[b++] = tp->texto_decodificado[tp->buffer_pos++];
-                    } else {
-                        tp->buffer_pos++;
-                    }
-                }
-                buffer[b] = '\0';
-                tp->buffer_pos++;
-
-                double temp_double;
-                if (sscanf(buffer, "%lf", &temp_double) == 1) {
-                    double boosted_temp = temp_double * AMPLITUDE_FACTOR;
-                    
-                    int32_t temp_val;
-                    if (boosted_temp > INT32_MAX_VAL) temp_val = INT32_MAX_VAL;
-                    else if (boosted_temp < INT32_MIN_VAL) temp_val = INT32_MIN_VAL;
-                    else temp_val = (int32_t)boosted_temp;
-                    
-                    tp->samples[tp->sample_count++] = temp_val;
-                }
-            }
-            
-            if (tp->sample_count < max_samples) {
-                tp->samples[tp->sample_count++] = sample_val;
-            }
-
-        } else if (sscanf(buffer, "%lf", &num_double) == 1) {
-            // Padrão: apenas um número
-            ensure_samples_capacity(tp, 1);
-            double boosted_sample = num_double * AMPLITUDE_FACTOR;
-            
-            int32_t sample_val;
-            if (boosted_sample > INT32_MAX_VAL) sample_val = INT32_MAX_VAL;
-            else if (boosted_sample < INT32_MIN_VAL) sample_val = INT32_MIN_VAL;
-            else sample_val = (int32_t)boosted_sample;
-            
-            tp->samples[tp->sample_count++] = sample_val;
-        }
-    }
-}
-
-txacplay_desc *txacplay_open(const char *path, uint32_t sample_rate, uint16_t channels) {
-    FILE *file = fopen(path, "rb");
-    if (!file) {
-        fprintf(stderr, "Erro ao abrir arquivo: %s\n", path);
-        return NULL;
-    }
-
-    txacplay_desc *tp = malloc(sizeof(txacplay_desc));
-    memset(tp, 0, sizeof(txacplay_desc));
-    
-    tp->file = file;
-    tp->sample_rate = sample_rate;
-    tp->channels = channels;
-    tp->sample_pos = 0;
-    tp->is_paused = 0; // Começa sem pausar
-    
-    // Aloca buffers iniciais
-    ensure_text_capacity(tp, 0);
-    ensure_samples_capacity(tp, 0);
-    
-    // Decodifica arquivo binário para texto
-    printf("Decodificando arquivo binário...\n");
-    binario_para_texto(tp);
-    printf("Arquivo decodificado. Tamanho do texto: %zu bytes\n", tp->texto_length);
-    
-    // Descompacta tudo para calcular total de amostras
-    printf("Descompactando e aplicando ganho de %.1f dB...\n", GAIN_DB);
-    descompactar_chunk(tp, INT32_MAX_VAL);
-    tp->total_samples = tp->sample_count;
-    printf("Total de amostras: %u\n", tp->total_samples);
-    
-    // Reinicia para playback
-    tp->sample_pos = 0;
-    
-    return tp;
-}
-
-void txacplay_close(txacplay_desc *tp) {
-    if (tp) {
-        if (tp->file) fclose(tp->file);
-        if (tp->texto_decodificado) free(tp->texto_decodificado);
-        if (tp->samples) free(tp->samples);
-        free(tp);
-    }
-}
-
-void txacplay_rewind(txacplay_desc *tp) {
-    tp->sample_pos = 0;
-}
-
-unsigned int txacplay_decode(txacplay_desc *tp, float *sample_data, int num_samples) {
-    // Se estiver pausado, retorna silêncio
-    if (tp->is_paused) {
-        memset(sample_data, 0, num_samples * sizeof(float));
-        return num_samples;
-    }
-    
-    int samples_written = 0;
-    
-    // Fator de normalização constante (1 / 2^31)
-    const float normalization_factor = 1.0f / 2147483648.0f;
-    
-    // Vetor AVX com o fator de normalização replicado 8 vezes
-    __m256 norm_vec = _mm256_set1_ps(normalization_factor);
-    
-    while (samples_written < num_samples) {
-        // Se chegou no fim, faz loop
-        if (tp->sample_pos >= tp->total_samples) {
-            txacplay_rewind(tp);
-        }
-        
-        // Calcula quantas amostras podemos copiar sem passar do final
-        int samples_remaining = tp->total_samples - tp->sample_pos;
-        int samples_to_copy = num_samples - samples_written;
-        
-        if (samples_to_copy > samples_remaining) {
-            samples_to_copy = samples_remaining;
-        }
-        
-        // --- PROCESSAMENTO AVX ---
-        // Processa blocos de 8 samples por vez
-        int avx_blocks = samples_to_copy / AVX_BLOCK_SIZE;
-        int avx_processed = 0;
-        
-        for (int block = 0; block < avx_blocks; block++) {
-            int src_idx = tp->sample_pos + avx_processed;
-            int dst_idx = samples_written + avx_processed;
-            
-            // 1. Carrega 8 samples (int32) do buffer
-            __m256i int_vec = _mm256_loadu_si256((__m256i*)&tp->samples[src_idx]);
-            
-            // 2. Converte int32 para float32
-            __m256 float_vec = _mm256_cvtepi32_ps(int_vec);
-            
-            // 3. Normaliza (multiplica pelo fator)
-            __m256 normalized_vec = _mm256_mul_ps(float_vec, norm_vec);
-            
-            // 4. Armazena no buffer de saída
-            _mm256_storeu_ps(&sample_data[dst_idx], normalized_vec);
-            
-            avx_processed += AVX_BLOCK_SIZE;
-        }
-        
-        // --- PROCESSAMENTO SEQUENCIAL (CAUDA) ---
-        // Processa as amostras restantes (< 8)
-        int remaining = samples_to_copy - avx_processed;
-        for (int i = 0; i < remaining; i++) {
-            int src_idx = tp->sample_pos + avx_processed + i;
-            int dst_idx = samples_written + avx_processed + i;
-            
-            int32_t sample = tp->samples[src_idx];
-            sample_data[dst_idx] = sample * normalization_factor;
-        }
-        
-        tp->sample_pos += samples_to_copy;
-        samples_written += samples_to_copy;
-    }
-    
-    return num_samples;
-}
-
-double txacplay_get_duration(txacplay_desc *tp) {
-    // Total de amostras dividido pelos canais para obter tempo real
-    return (double)tp->total_samples / (double)(tp->sample_rate * tp->channels);
-}
-
-double txacplay_get_time(txacplay_desc *tp) {
-    // Posição atual dividida pelos canais para obter tempo real
-    return (double)tp->sample_pos / (double)(tp->sample_rate * tp->channels);
-}
-
-void txacplay_seek(txacplay_desc *tp, double time_seconds) {
-    // Multiplica pelo número de canais porque samples está entrelaçado
-    unsigned int target_sample = (unsigned int)(time_seconds * tp->sample_rate * tp->channels);
-    if (target_sample > tp->total_samples) {
-        target_sample = tp->total_samples;
-    }
-    tp->sample_pos = target_sample;
-}
-
-/* ============================================================================
-   CÓDIGO DA APLICAÇÃO
-   ============================================================================ */
-
-// getch() para windows/mac/linux
 #if defined(_WIN32)
     #include <conio.h>
 #else
@@ -396,111 +41,419 @@ void txacplay_seek(txacplay_desc *tp, double time_seconds) {
     }
 #endif
 
-void txacplay_toggle_pause(txacplay_desc *tp) {
-    tp->is_paused = !tp->is_paused;
-    if (tp->is_paused) {
-        printf("\n⏸️  PAUSADO\n");
-    } else {
-        printf("\n▶️  REPRODUZINDO\n");
+#define SOKOL_AUDIO_IMPL
+#include "sokol_audio.h"
+
+#define TXAC_MAGIC "TXAC"
+#define MAX_CHANNELS 8
+#define NORMALIZATION_DIVISOR 0.0002147483648f 
+
+const char simbolos[16] = {
+    '0','1','2','3','4','5','6','7','8','9',
+    ',', '^', '~', '(', ')', '-'
+};
+
+typedef struct {
+    uint32_t sample_rate;
+    uint16_t channels;
+    uint16_t bits_per_sample;
+    uint32_t flags;
+    uint64_t total_samples;
+} TXACHeader;
+
+// ============================================================================
+// BUFFER FLOAT DIRETO
+// ============================================================================
+typedef struct {
+    float *data;        
+    uint64_t capacity;
+    uint64_t count;
+} BufferFloat;
+
+void init_buffer_float(BufferFloat *buf, uint64_t initial_capacity) {
+    buf->capacity = initial_capacity;
+    buf->count = 0;
+    buf->data = (float*)malloc(buf->capacity * sizeof(float));
+    if (!buf->data) {
+        fprintf(stderr, "Error: Failed to allocate RAM for float buffer\n");
+        exit(1);
     }
+}
+
+void ensure_buffer_capacity_float(BufferFloat *buf, uint64_t required) {
+    if (buf->count + required >= buf->capacity) {
+        uint64_t new_cap = buf->capacity * 2;
+        while (buf->count + required >= new_cap) new_cap *= 2;
+        
+        float *new_ptr = (float*)realloc(buf->data, new_cap * sizeof(float));
+        if (!new_ptr) {
+            fprintf(stderr, "Error: Insuficient memory (RAM is full)\n");
+            exit(1);
+        }
+        buf->data = new_ptr;
+        buf->capacity = new_cap;
+    }
+}
+
+void push_value_float(BufferFloat *buf, float value) {
+    ensure_buffer_capacity_float(buf, 1);
+    buf->data[buf->count++] = value;
+}
+
+// ============================================================================
+// PARSER DIRETO DE 4-BIT → FLOAT
+// ============================================================================
+typedef struct {
+    uint8_t *raw_data;  // Dados 4-bit brutos do arquivo
+    size_t byte_count;
+    size_t byte_pos;
+    int nibble_pos;     // 0 = high nibble, 1 = low nibble
+} Stream4Bit;
+
+void init_stream(Stream4Bit *s, uint8_t *data, size_t size) {
+    s->raw_data = data;
+    s->byte_count = size;
+    s->byte_pos = 0;
+    s->nibble_pos = 0;
+}
+
+char read_next_char(Stream4Bit *s) {
+    if (s->byte_pos >= s->byte_count) return '\0';
+    
+    uint8_t byte = s->raw_data[s->byte_pos];
+    char c;
+    
+    if (s->nibble_pos == 0) {
+        // High nibble
+        c = simbolos[(byte >> 4) & 0x0F];
+        s->nibble_pos = 1;
+    } else {
+        // Low nibble
+        c = simbolos[byte & 0x0F];
+        s->nibble_pos = 0;
+        s->byte_pos++;
+    }
+    
+    return c;
+}
+
+void read_token_stream(Stream4Bit *s, char *buffer, size_t max_len) {
+    size_t idx = 0;
+    char c;
+    
+    while ((c = read_next_char(s)) != '\0' && c != ',') {
+        if (idx < max_len - 1) {
+            buffer[idx++] = c;
+        }
+    }
+    buffer[idx] = '\0';
+}
+
+// ============================================================================
+// DESCOMPRESSÃO DIRETA PARA FLOAT
+// ============================================================================
+typedef struct {
+    int channel_id;
+    uint8_t *compressed_4bit;
+    size_t compressed_size;
+    BufferFloat *output_buffer;
+    pthread_t thread;
+    volatile int finished;
+} ChannelLoader;
+
+void process_stream_to_float(ChannelLoader *ldr, Stream4Bit *stream, uint64_t *sample_idx, int recursion_depth) {
+    if (recursion_depth > 100) return;
+    
+    char token[64];
+    
+    while (stream->byte_pos < stream->byte_count || stream->nibble_pos > 0) {
+        read_token_stream(stream, token, 64);
+        
+        if (token[0] == '\0') continue;
+        if (token[0] == '(' || token[0] == ')') continue;
+        
+        double num_d;
+        int rep;
+        float val_float;
+        
+        // Caso 1: Repetição (valor^repeticoes)
+        if (sscanf(token, "%lf^%d", &num_d, &rep) == 2) {
+            // Converte int32 → float AQUI (uma vez só)
+            val_float = (float)((int32_t)num_d) * NORMALIZATION_DIVISOR;
+            
+            ensure_buffer_capacity_float(ldr->output_buffer, rep);
+            for (int i = 0; i < rep; i++) {
+                ldr->output_buffer->data[ldr->output_buffer->count++] = val_float;
+                (*sample_idx)++;
+            }
+            if (recursion_depth > 0) return;
+        }
+        // Caso 2: Sniper/Loop (valor~distancia)
+        else if (sscanf(token, "%lf~%d", &num_d, &rep) == 2) {
+            val_float = (float)((int32_t)num_d) * NORMALIZATION_DIVISOR;
+            push_value_float(ldr->output_buffer, val_float);
+            (*sample_idx)++;
+            
+            for (int i = 0; i < rep; i++) {
+                process_stream_to_float(ldr, stream, sample_idx, recursion_depth + 1);
+            }
+            
+            push_value_float(ldr->output_buffer, val_float);
+            (*sample_idx)++;
+            if (recursion_depth > 0) return;
+        }
+        // Caso 3: Valor simples
+        else if (sscanf(token, "%lf", &num_d) == 1) {
+            val_float = (float)((int32_t)num_d) * NORMALIZATION_DIVISOR;
+            push_value_float(ldr->output_buffer, val_float);
+            (*sample_idx)++;
+            if (recursion_depth > 0) return;
+        }
+    }
+}
+
+void *loader_thread_func(void *arg) {
+    ChannelLoader *ldr = (ChannelLoader*)arg;
+    uint64_t sample_idx = 0;
+    
+    printf("  [Channel %d] Decompressing 4bit to float directly...\n", ldr->channel_id);
+    
+    Stream4Bit stream;
+    init_stream(&stream, ldr->compressed_4bit, ldr->compressed_size);
+    process_stream_to_float(ldr, &stream, &sample_idx, 0);
+    
+    printf("  [Channel %d] %llu samples loaded\n", ldr->channel_id, (unsigned long long)sample_idx);
+    ldr->finished = 1;
+    return NULL;
+}
+
+// ============================================================================
+// ESTRUTURAS PRINCIPAIS
+// ============================================================================
+typedef struct {
+    FILE *file;
+    TXACHeader header;
+    float *pcm_data; // Buffer final intercalado JÁ EM FLOAT
+    uint64_t total_samples;
+    volatile uint64_t playback_cursor;
+    volatile int is_paused;
+    volatile int running;
+    ChannelLoader loaders[MAX_CHANNELS];
+    BufferFloat channel_buffers[MAX_CHANNELS];
+} txacplay_desc;
+
+// ============================================================================
+// INTERCALAÇÃO (FLOAT)
+// ============================================================================
+void intercalar_canais_float(txacplay_desc *tp) {
+    printf("\nInterleaving channels in RAM...\n");
+    
+    uint64_t frames = tp->channel_buffers[0].count;
+    for (int i = 1; i < tp->header.channels; i++) {
+        if (tp->channel_buffers[i].count < frames) {
+            frames = tp->channel_buffers[i].count;
+        }
+    }
+
+    tp->total_samples = frames * tp->header.channels;
+    
+    tp->pcm_data = (float *)malloc(tp->total_samples * sizeof(float));
+    if (!tp->pcm_data) {
+        printf("Fatal error: No RAM for final buffer. (%llu samples)\n", tp->total_samples);
+        exit(1);
+    }
+    
+    for (uint64_t f = 0; f < frames; f++) {
+        for (int c = 0; c < tp->header.channels; c++) {
+            tp->pcm_data[f * tp->header.channels + c] = tp->channel_buffers[c].data[f];
+        }
+    }
+    
+    double size_mb = (double)(tp->total_samples * sizeof(float)) / (1024.0 * 1024.0);
+    printf("Ready: %.2f MB of RAM for audio decompressed.\n", size_mb);
+}
+
+// ============================================================================
+// CÁLCULO DE TEMPO
+// ============================================================================
+double calculate_time(txacplay_desc *tp) {
+    return (double)tp->playback_cursor / (double)(tp->header.sample_rate * tp->header.channels);
+}
+
+double calculate_duration(txacplay_desc *tp) {
+    return (double)tp->total_samples / (double)(tp->header.sample_rate * tp->header.channels);
+}
+
+// ============================================================================
+// CALLBACK SOKOL (SUPER OTIMIZADO - JÁ É FLOAT!)
+// ============================================================================
+void audio_cb(float *buffer, int num_frames, int num_channels, void *user_data) {
+    txacplay_desc *tp = (txacplay_desc*)user_data;
+    
+    if (tp->is_paused || !tp->running || !tp->pcm_data) {
+        memset(buffer, 0, num_frames * num_channels * sizeof(float));
+        return;
+    }
+    
+    int total_samples = num_frames * num_channels;
+    
+    // COPIA DIRETA - SEM CONVERSÃO!
+    for (int i = 0; i < total_samples; i++) {
+        if (tp->playback_cursor >= tp->total_samples) tp->playback_cursor = 0;
+        buffer[i] = tp->pcm_data[tp->playback_cursor++];
+    }
+    double current = calculate_time(tp);
+    double duration = calculate_duration(tp);
+    printf("\r%.2f / %.2f sec", current, duration);
     fflush(stdout);
 }
 
-// Callback do Sokol Audio
-static void sokol_audio_cb(float* sample_data, int num_samples, int num_channels, void *user_data) {
-    txacplay_desc *txacplay = (txacplay_desc *)user_data;
-    
-    if (num_channels != txacplay->channels) {
-        printf("Audio cb channels %d não igual txac channels %d\n", num_channels, txacplay->channels);
-        exit(1);
+void toggle_pause(txacplay_desc *tp) {
+    tp->is_paused = !tp->is_paused;
+    if (tp->is_paused) {
+        printf("\nPAUSED\n");
+    } else {
+        printf("\nPLAYING\n");
     }
+}
 
-    // num_samples aqui é o número de FRAMES (não samples individuais)
-    // Para stereo: num_samples frames = num_samples * 2 samples totais
-    int total_samples_needed = num_samples * num_channels;
+void txacplay_seek_absolute(txacplay_desc *tp, double time_seconds) {
+    double samples_per_second = (double)tp->header.sample_rate * tp->header.channels;
+    uint64_t target_samples = (uint64_t)(time_seconds * samples_per_second);
     
-    txacplay_decode(txacplay, sample_data, total_samples_needed);
+    uint64_t remainder = target_samples % tp->header.channels;
+    target_samples -= remainder;
+    
+    if (target_samples > tp->total_samples) {
+        target_samples = tp->total_samples - (tp->total_samples % tp->header.channels);
+    }
+    if (time_seconds < 0) target_samples = 0;
+    
+    tp->playback_cursor = target_samples;
+}
 
-    printf("\r %.2f / %.2f sec", txacplay_get_time(txacplay), txacplay_get_duration(txacplay));
+void update_timer(txacplay_desc *tp) {
+    double current = calculate_time(tp);
+    double duration = calculate_duration(tp);
+    printf("\r%.2f / %.2f sec", current, duration);
     fflush(stdout);
+}
+
+// ============================================================================
+// ABERTURA E SETUP
+// ============================================================================
+txacplay_desc *txacplay_open(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    
+    txacplay_desc *tp = (txacplay_desc*)calloc(1, sizeof(txacplay_desc));
+    tp->file = f;
+    
+    char magic[4]; fread(magic, 1, 4, f);
+    uint32_t trash; fread(&trash, 4, 1, f);
+    fread(&tp->header.sample_rate, 4, 1, f);
+    fread(&tp->header.channels, 2, 1, f);
+    fread(&tp->header.bits_per_sample, 2, 1, f);
+    fread(&tp->header.flags, 4, 1, f);
+    fread(&tp->header.total_samples, 8, 1, f);
+    fseek(f, 36, SEEK_CUR);
+    
+    uint64_t offsets[MAX_CHANNELS], sizes[MAX_CHANNELS];
+    for (int i = 0; i < tp->header.channels; i++) {
+        fread(&offsets[i], 8, 1, f);
+        fread(&sizes[i], 8, 1, f);
+    }
+    
+    // Inicia threads que fazem parsing direto 4bit→float
+    for (int i = 0; i < tp->header.channels; i++) {
+        init_buffer_float(&tp->channel_buffers[i], tp->header.total_samples / tp->header.channels);
+        
+        tp->loaders[i].channel_id = i;
+        tp->loaders[i].output_buffer = &tp->channel_buffers[i];
+        tp->loaders[i].compressed_size = sizes[i];
+        
+        // Lê dados 4-bit brutos (SEM converter pra texto!)
+        tp->loaders[i].compressed_4bit = malloc(sizes[i]);
+        fseek(f, offsets[i], SEEK_SET);
+        fread(tp->loaders[i].compressed_4bit, 1, sizes[i], f);
+        
+        pthread_create(&tp->loaders[i].thread, NULL, loader_thread_func, &tp->loaders[i]);
+    }
+    
+    for (int i = 0; i < tp->header.channels; i++) {
+        pthread_join(tp->loaders[i].thread, NULL);
+        free(tp->loaders[i].compressed_4bit);
+    }
+    
+    intercalar_canais_float(tp);
+    
+    for (int i = 0; i < tp->header.channels; i++) {
+        free(tp->channel_buffers[i].data);
+    }
+    
+    tp->running = 1;
+    return tp;
+}
+
+void txacplay_close(txacplay_desc *tp) {
+    if (!tp) return;
+    tp->running = 0;
+    if (tp->pcm_data) free(tp->pcm_data);
+    if (tp->file) fclose(tp->file);
+    free(tp);
 }
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        printf("Uso: txacplay <arquivo.txac> [sample_rate] [channels]\n");
-        printf("Exemplo: txacplay audio.txac 44100 1\n");
-        exit(1);
+        printf("Use: %s <arquivo.txac>\n", argv[0]);
+        return 1;
     }
-
-    // Parâmetros padrão
-    uint32_t sample_rate = 44100;
-    uint16_t channels = 1;
     
-    if (argc >= 3) {
-        sample_rate = atoi(argv[2]);
+    printf("Starting TXAC Player v0.2.0...\n");
+    txacplay_desc *tp = txacplay_open(argv[1]);
+    if(!tp) {
+        printf("Error opening file.\n");
+        return 1;
     }
-    if (argc >= 4) {
-        channels = atoi(argv[3]);
-    }
-
-    printf("Abrindo arquivo TXAC: %s\n", argv[1]);
-    printf("Sample rate: %u Hz, Canais: %u\n", sample_rate, channels);
-    
-    txacplay_desc *txacplay = txacplay_open(argv[1], sample_rate, channels);
-
-    if (!txacplay) {
-        printf("Falha ao carregar %s\n", argv[1]);
-        exit(1);
-    }
-
-    printf("\n=== INFORMAÇÕES DO ÁUDIO ===\n");
-    printf("Arquivo: %s\n", argv[1]);
-    printf("Canais: %d\n", txacplay->channels);
-    printf("Sample rate: %d Hz\n", txacplay->sample_rate);
-    printf("Total de amostras (entrelaçadas): %u\n", txacplay->total_samples);
-    printf("Amostras por canal: %u\n", txacplay->total_samples / txacplay->channels);
-    printf("Duração: %.2f segundos\n", txacplay_get_duration(txacplay));
-    printf("\n🎵 Controles:\n");
-    printf("  [ESPAÇO] pausar/retomar\n");
-    printf("  [x] voltar 5s\n");
-    printf("  [c] avançar 5s\n");
-    printf("  [q] sair\n");
-    printf("\n⚡ Otimização AVX ativada!\n\n");
 
     saudio_setup(&(saudio_desc){
-        .sample_rate = txacplay->sample_rate,
-        .num_channels = txacplay->channels,
-        .stream_userdata_cb = sokol_audio_cb,
-        .user_data = txacplay,
-        .buffer_frames = 2048  // Aumenta o buffer para evitar cintilação
+        .sample_rate = tp->header.sample_rate,
+        .num_channels = tp->header.channels,
+        .stream_userdata_cb = audio_cb,
+        .user_data = tp,
+        .buffer_frames = 4096
     });
-
+    
+    printf("Playing...\n Press:\n [space] to pause\n [x] to go back 5s\n [c] to go forward 5s\n [q] to exit\n\n");
+    
     int wants_to_quit = 0;
     while (!wants_to_quit) {
         char c = getch();
+        
         switch (c) {
-            case ' ':  // Barra de espaço
-                txacplay_toggle_pause(txacplay);
+            case ' ':
+                toggle_pause(tp);
                 break;
-            case 'c': {
-                double current = txacplay_get_time(txacplay);
-                txacplay_seek(txacplay, current + 5.0);
+            case 'x': {
+                double current = calculate_time(tp);
+                txacplay_seek_absolute(tp, current - 5.0);
                 break;
             }
-            case 'x': {
-                double current = txacplay_get_time(txacplay);
-                txacplay_seek(txacplay, current - 5.0);
+            case 'c': {
+                double current = calculate_time(tp);
+                txacplay_seek_absolute(tp, current + 5.0);
                 break;
             }
             case 'q': 
                 wants_to_quit = 1; 
                 break;
         }
+        
+        update_timer(tp);
     }
-
+    
     saudio_shutdown();
-    txacplay_close(txacplay);
-
-    printf("\n");
+    txacplay_close(tp);
+    printf("\n\nBye bye\n");
     return 0;
 }
