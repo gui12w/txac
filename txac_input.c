@@ -472,7 +472,7 @@ void *compactar_canal_4bit_thread(void *arg) {
 
 int main(int argc, char **argv) {
     if (argc < 3) {
-        printf("Uso: %s <input> <output.txac> [--loop]\n", argv[0]);
+        printf("Usage: %s <input> <output.txac> [--loop]\n", argv[0]);
         return 1;
     }
 
@@ -500,7 +500,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    printf("\n🔄 Compactando %d canais...\n", header.channels);
+    printf("\nCompressing %d channels...\n", header.channels);
     
     pthread_t threads[MAX_CHANNELS];
     ThreadData thread_data[MAX_CHANNELS];
@@ -519,10 +519,10 @@ int main(int argc, char **argv) {
         pthread_join(threads[i], NULL);
     }
 
-    printf("\n💾 Salvando container TXAC v3...\n");
+    printf("\nSaving container TXAC v0.2.0...\n");
     FILE *fout = fopen(output, "wb");
     if (!fout) {
-        perror("Erro ao criar arquivo");
+        perror("Error creating file");
         return 1;
     }
 
@@ -569,7 +569,7 @@ int main(int argc, char **argv) {
         offsets[i] = ftell(fout);
         fwrite(outputs[i].data, 1, outputs[i].byte_count, fout);
         sizes[i] = outputs[i].byte_count;
-        printf("  Canal %d: %llu bytes\n", i, sizes[i]);
+        printf("  Channel %d: %llu bytes\n", i, sizes[i]);
     }
 
 
@@ -581,6 +581,6 @@ int main(int argc, char **argv) {
     }
     if (is_temp) remove(temp_wav);
 
-    printf("\n✅ Codificação concluída!\n");
+    printf("\nCoding complete!\n");
     return 0;
 }
