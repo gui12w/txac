@@ -508,7 +508,8 @@ void audio_cb(ma_device* pDevice, void* pOutput, const void* pInput, ma_uint32 f
         // Conversão 14-bit -> float ao vivo
         buffer[i] = (float)unpack14(tp->pcm_data_14bit, tp->playback_cursor++) * cf;
     }
-
+    printf("\r%.2f / %.2f sec", calculate_time(tp), calculate_duration(tp));
+    fflush(stdout);
 }
 
 void toggle_pause(txacplay_desc *tp) {
@@ -623,7 +624,7 @@ int main(int argc, char **argv) {
         return 1;
     }
     
-    printf("Starting TXAC Player v0.3.0...\n");
+    printf("Starting TXAC Player v0.3.1...\n");
     txacplay_desc *tp = txacplay_open(argv[1]);
     if (!tp) {
         printf("Error opening file.\n");
