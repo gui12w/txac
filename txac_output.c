@@ -421,7 +421,7 @@ int main(int argc, char **argv) {
     const char *input  = argv[1];
     const char *output = argv[2];
 
-    printf("\nTXAC output v0.3.0\n");
+    printf("\nTXAC output v0.3.1\n");
     //printf("Input:  %s\n", input);
     //printf("Output: %s\n\n", output);
 
