@@ -514,7 +514,7 @@ int main(int argc, char **argv) {
     const char *output = argv[2];
     int enable_loop = (argc >= 4 && strcmp(argv[3], "--loop") == 0);
 
-    printf("\n=== TXAC Encoder v0.3.0 (Delta Encoding) ===\n");
+    printf("\n=== TXAC Encoder v0.3.1 (Delta Encoding) ===\n");
 
     char temp_wav[256] = {0};
     int is_temp = 0;
